@@ -167,31 +167,15 @@ def inverse_flip(preds,flipx):
 
 class Localizer(nn.Module):
     def __init__(self,model,n_transforms=8,**kwargs):
-        super(LocalizerClassifier, self).__init__()
+        super(Localizer, self).__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         #self.model=nn.Sequential(model,torch.nn.Sigmoid()).to(self.device)
         self.model = model.to(self.device)
         #self.loss=LodestarLoss(beta)
         self.n_transforms=n_transforms
-
-
         return
     def forward(self,x):
-
         return self.model(x.to(self.device))
-
-
-    def consistency_loss(self, invpred,probmap):
-        # invpred: [B, T, 2]
-        # probmap: [B,T,1,l,l]
-        diffs = invpred[:, 1:, :] - invpred[:, :-1, :]  # [B, T-1, 2]
-        mse_per_sample = torch.mean((diffs ** 2).sum(dim=-1), dim=1)  # [B]
-
-        total_mass = probmap.sum(dim=[1, 2,3,4])  # [B]
-        mass_loss = -torch.log(0.1*total_mass + 1e-8)
-
-        return mse_per_sample + self.alpha * mass_loss  # [B]
-
 
     def forward_tranform(self,batch,translation,angles):
         transformed=image_translation(batch,translation)
@@ -220,7 +204,7 @@ class Localizer(nn.Module):
         transform_im=self.forward_tranform(flat,tr_flat,ag_flat)
         pred_flat=self.model(transform_im)
 
-        preds=pred_flat.view(b,self.n_transforms,1,h,w)
+        #preds=pred_flat.view(b,self.n_transforms,1,h,w)
 
         centroids_flat=mass_centroid(pred_flat)
 
@@ -233,7 +217,7 @@ class Localizer(nn.Module):
 
         diffs = invpred[:, 1:, :] - invpred[:, :-1, :]  # [B, T-1, 2]
         mse_per_sample = torch.mean((diffs ** 2).sum(dim=-1), dim=1)  # [B]
-        return mse_per_sample
+        return mse_per_sample.sum()
 
 
 
@@ -319,7 +303,7 @@ class LocalizerClassifier(nn.Module):
         return loss
 
 
-def train_localizer(loc, dataloader, optimizer, epochs=300,filename="filename"):
+def train_localizer_classifier(loc, dataloader, optimizer, epochs=300, filename="filename"):
     loc.train()
     device = loc.device
     try:
@@ -345,3 +329,75 @@ def train_localizer(loc, dataloader, optimizer, epochs=300,filename="filename"):
     finally:
         torch.save(loc.state_dict(), filename)
         print(f"Model saved to {filename}")
+
+
+def train_localizer(loc, dataloader, optimizer, epochs=300, filename="filename"):
+    loc.train()
+    device = loc.device
+    try:
+        for epoch in range(1, epochs + 1):
+            epoch_loss = 0.0
+            for inputs in dataloader:
+                inputs = inputs.to(device)  # [B, C, H, W]
+
+                optimizer.zero_grad()
+                loss = loc.get_loss(inputs)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item() * inputs.size(0)  # sum up batch loss
+
+            avg_loss = epoch_loss / len(dataloader.dataset)
+            print(f"Epoch {epoch:3d}/{epochs}, avg loss: {avg_loss:.4f}")
+
+
+    except KeyboardInterrupt:
+        print("\n Training manually quit")
+    finally:
+        torch.save(loc.state_dict(), filename)
+        print(f"Model saved to {filename}")
+
+
+#VAE--------------------------------------------------------------------------------------------
+
+# Simple VAE class
+class VAE(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=400, latent_dim=20):
+        super(VAE, self).__init__()
+
+        # Encoder
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # Decoder
+        self.fc2 = nn.Linear(latent_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, input_dim)
+
+    def encode(self, x):
+        h = F.relu(self.fc1(x))
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        h = F.relu(self.fc2(z))
+        return torch.sigmoid(self.fc3(h))
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+    def get_loss(self, x):
+        BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return BCE + KLD
+# Loss function
+
+
