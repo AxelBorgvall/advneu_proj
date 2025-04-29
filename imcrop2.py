@@ -18,7 +18,7 @@ crop_regions = [
     (0, 355,440,610,660),  # xlow,xhigh,ylow,yhigh
     (0, 330,380,110,170),  # xlow,xhigh,ylow,yhigh
     (1,490,530,130,180),
-    (1,100,140,440,190),
+    (1,100,140,440,490),
     (1,360,410,620,660),
     (3,510,550,410,455)
 ]
@@ -54,6 +54,8 @@ def process_images(input_dir, output_dir, crop_regions):
                 base_name = os.path.splitext(file_name)[0]
 
                 output_file = os.path.join(output_dir, f"{base_name}_crop_{crop_idx + 1}.pt")
+
+                cropped_img=torch.from_numpy(cropped_img).to(torch.int64)
 
                 # Save the cropped image
                 torch.save(cropped_img,output_file)
