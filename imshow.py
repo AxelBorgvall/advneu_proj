@@ -32,7 +32,13 @@ def handle_qs(list,tensor):
         torch.save(list[i],f"SingleParticleImages/singlecell_nr_{i+offset}")
     sys.exit()
 def handle_c(list,tensor):
-    return
+    print("Enter image id: ")
+    s=input()
+    ind=int(s)
+    filename = f'Fluo-N2DL-HeLa/01/t{ind:03}.tif'
+    array = tifffile.imread(filename)
+    tensor = torch.from_numpy(array)
+    return tensor
 
 def handle_default(list,tensor):
     print("Default")
@@ -43,8 +49,9 @@ switch = {
     "a":handle_a,
     "c":handle_c
 }
+
 while True:
-    filename = f'Fluo-N2DL-HeLa/01/t{i+offset:03}.tif'
+    filename = f'Fluo-N2DL-HeLa/01/t{i + offset:03}.tif'
     array = tifffile.imread(filename)
     tensor = torch.from_numpy(array)
     if tensor.dtype == torch.uint16:
@@ -52,17 +59,15 @@ while True:
         min = tensor.min()
         max = tensor.max()
         tensor = (tensor - min) / (max - min)
-    fig, ax = plt.subplots()
-    ax.imshow(tensor, cmap='gray')
-    ax.axis('off')
 
-    plt.show(block=False)  # Non-blocking display
-    plt.pause(0.2)
-    while True:
-        print(f"Viewing image {i}, \"a\" to crop and append,  \"q\" to quit without saving, \"qs\" to quit and save,  \"c\" to continue to next image")
-        s=input()
-        switch.get(s, handle_default)(myims,tensor)  # calls correct function
-        if s == "c":
-            plt.close(fig)  # Close the figure before continuing to next image
-            break
-    i+=1
+    fig,ax=plt.subplots(1,1)
+    ax.imshow(tensor.permute(0,1),cmap="gray")
+    plt.show()
+
+    print(
+        f"Viewing image {i}, \"a\" to crop and append,  \"q\" to quit without saving, \"qs\" to quit and save,  \"c\" to load other image")
+    s = input()
+    ret=switch.get(s, handle_default)(myims, tensor)  # calls correct function
+    if not ret==None:
+        tensor=ret
+    i += 1
