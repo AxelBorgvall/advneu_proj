@@ -194,7 +194,7 @@ class Localizer(nn.Module):
         flat=images.view(b*self.n_transforms,c,h,w)
 
         #getting random args
-        tr = torch.rand(b, self.n_transforms, 2, device=images.device) * h//6 - h//12  # translations
+        tr = torch.rand(b, self.n_transforms, 2, device=images.device) * h//3 - h//6  # translations
         ag = torch.rand(b, self.n_transforms, device=images.device) * 360  # angles
         #flatten random args
         tr_flat = tr.view(b * self.n_transforms, 2)
