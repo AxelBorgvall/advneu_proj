@@ -362,7 +362,7 @@ def train_localizer(loc, dataloader, optimizer, epochs=300, filename="filename")
 
 # Simple VAE class
 class VAE(nn.Module):
-    def __init__(self, input_dim=784, hidden_dim=400, latent_dim=20):
+    def __init__(self,inputshape,latent_dim,convchannels=[16,32],fc_layers=[512,256]):
         super(VAE, self).__init__()
 
         # Encoder
@@ -394,7 +394,7 @@ class VAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
 
-    def get_loss(self, x):
+    def get_loss(self,recon_x, x,logvar,mu):
         BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return BCE + KLD
