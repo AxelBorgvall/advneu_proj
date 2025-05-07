@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from kornia.geometry.transform import translate,rotate
-
+import tqdm
 class DoubleConv(nn.Module):
     """(Conv => ReLU => Conv => ReLU)"""
     def __init__(self, in_channels, out_channels):
@@ -204,6 +204,8 @@ class Localizer(nn.Module):
         transform_im=self.forward_tranform(flat,tr_flat,ag_flat)
         pred_flat=self.model(transform_im)
 
+
+
         #preds=pred_flat.view(b,self.n_transforms,1,h,w)
 
         centroids_flat=mass_centroid(pred_flat)
@@ -360,24 +362,76 @@ def train_localizer(loc, dataloader, optimizer, epochs=300, filename="filename")
 
 #VAE--------------------------------------------------------------------------------------------
 
+class ReshapeLayer(nn.Module):
+    def __init__(self, channels, height, width):
+        super(ReshapeLayer, self).__init__()
+        self.channels = channels
+        self.height = height
+        self.width = width
+
+    def forward(self, x):
+        #reshape the tensor back to [batch_size, channels, height, width]
+        return x.view(-1, self.channels, self.height, self.width)
+
 # Simple VAE class
 class VAE(nn.Module):
-    def __init__(self,inputshape,latent_dim,convchannels=[16,32],fc_layers=[512,256]):
+    def __init__(self,inputshape,latent_dim,convchannels=[16,32],fc_layers=[512,256],beta=0.1):
         super(VAE, self).__init__()
+        self.beta=beta
+        self.conv_dim = (
+        convchannels[-1], inputshape[0] // (2 ** len(convchannels)), inputshape[1] // (2 ** len(convchannels)))
+        #Loop over convchannels and append conv maxpool/conv upscale to lists
+        convchannels.insert(0,1)
+        down=[]
 
-        # Encoder
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        up=[]
+        for i in range(len(convchannels)-1):
+            down.append(nn.Conv2d(convchannels[i],convchannels[i+1],kernel_size=(3,3)))
+            down.append(nn.ReLU())
+            down.append(nn.MaxPool2d(kernel_size=2, stride=2))
 
-        # Decoder
-        self.fc2 = nn.Linear(latent_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, input_dim)
+            if not i==0:
+                up.append(nn.ReLU())
+            else:
+                up.append(nn.Sigmoid())
+            up.append(nn.Conv2d(convchannels[i+1],convchannels[i],kernel_size=(3,3)))
+            up.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+
+
+        down.append(torch.nn.Flatten(start_dim=1))
+
+        up.append(ReshapeLayer(*self.conv_dim))
+        up.append(nn.ReLU())
+        up.append(nn.Linear(fc_layers[0],self.conv_dim[0]*self.conv_dim[1]*self.conv_dim[2] ))
+        up.reverse()
+
+        #Loop over fc_layers and add to list
+        down_linear=[]
+        up_linear=[]
+        for i in range(len(fc_layers)):
+            down_linear.append(nn.LazyLinear(fc_layers[i]))
+            down_linear.append(nn.ReLU())
+
+            up_linear.append(nn.ReLU())
+            up_linear.append(nn.LazyLinear(fc_layers[i]))
+
+        #up_linear.append(nn.Linear(latent_dim,fc_layers[-1]))
+        up_linear.reverse()
+
+        self.mu=nn.Linear(fc_layers[-1],latent_dim)
+        self.logvar=nn.Linear(fc_layers[-1],latent_dim)
+
+        #Turn into sequentials for decode and encode
+        self.down=nn.Sequential(*down,*down_linear)
+        self.decode=nn.Sequential(*up_linear,*up)
+
+        #print(self.down)
+        #print(self.decode)
 
     def encode(self, x):
-        h = F.relu(self.fc1(x))
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
+        h=self.down(x)
+        mu = self.mu(h)
+        logvar = self.logvar(h)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -385,19 +439,49 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z):
-        h = F.relu(self.fc2(z))
-        return torch.sigmoid(self.fc3(h))
-
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
 
-    def get_loss(self,recon_x, x,logvar,mu):
+    def get_loss(self,recon_x, x,logvar,mu,angle=0):
+        #Perform inverse rotation to judge reconstruction in fixed reference direction
+        recon_x=rotate(recon_x,-angle)
         BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + KLD
-# Loss function
+        return BCE + self.beta*KLD
+
+
+def train_vae(model, dataloader, optimizer, epochs, device='cuda' if torch.cuda.is_available() else 'cpu',
+              save_path='vae_checkpoint.pt'):
+    model = model.to(device)
+    try:
+        for epoch in range(1, epochs + 1):
+            model.train()
+            total_loss = 0
+            progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
+
+            for images, angles in progress_bar:
+                images = images.to(device)
+                angles = angles.to(device)
+
+                optimizer.zero_grad()
+                recon_x, mu, logvar = model(images)
+                loss = model.get_loss(recon_x, images, logvar, mu, angle=angles)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                progress_bar.set_postfix(loss=loss.item())
+
+            avg_loss = total_loss / len(dataloader.dataset)
+            print(f"Epoch {epoch} complete. Avg Loss: {avg_loss:.4f}")
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Saving model...")
+        torch.save(model.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
+
+
 
 

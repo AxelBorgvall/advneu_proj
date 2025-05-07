@@ -6,15 +6,20 @@ import matplotlib.pyplot as plt
 
 
 nims=8*12
-dir="VAE_single_cell2_rotated"
+dir="VAE_single_cell2"
 
 ims=torch.zeros((nims,64,64))
 
+maxfound=0
+
 for filenum,file in enumerate(os.listdir(dir)):
+
     filepath=os.path.join(dir,file)
-
     im=torch.from_numpy(tifffile.imread(filepath))
+    if im.max()>maxfound:
+        maxfound=im.max()
 
+    '''
     ims[filenum%nims]=im
 
     if (filenum+1)%nims==0:
@@ -26,8 +31,8 @@ for filenum,file in enumerate(os.listdir(dir)):
             ax.axis('off')
         plt.tight_layout()
         plt.show()
-
-
+    '''
+print(maxfound)
 
 
 

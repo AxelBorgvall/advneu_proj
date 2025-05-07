@@ -1,3 +1,4 @@
+import tifffile
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -93,5 +94,30 @@ class SingleCellDataset(Dataset):
     def __getitem__(self, idx):
         return self.inputs[idx]
 
+
+
+class VaeDataset(Dataset):
+    def __init__(self, image_dir, angles_path, transform=None):
+        self.paths = [
+            os.path.join(image_dir, fname)
+            for fname in os.listdir(image_dir)
+            if fname.endswith('.tif')
+        ]
+        self.angles = np.load(angles_path).astype('float32')  # Ensure float32
+        assert len(self.paths) == len(self.angles)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = tifffile.imread(self.paths[idx]).astype('float32')
+        img = torch.from_numpy(img).unsqueeze(0)  # shape (1, H, W)
+
+        angle = torch.tensor([self.angles[idx]])  # shape (1,)
+        if self.transform:
+            img = self.transform(img)
+
+        return img, angle
 
 
