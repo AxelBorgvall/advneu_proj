@@ -1,0 +1,13 @@
+**/test*
+TODO
+Fluo*/
+state_dicts/*.pth
+SingleParticleImages/
+lodestar_cropped_cell_images/
+GroomedSingleImages/
+VAE_single_cell/
+data/VAE_single_cell2/
+data/VAE_single_cell2_rotated/
+data/VAE_single_cell2/VAE_single_cell2_angles.npy
+data/VAE_single_cell2_noise
+anteckningar.txt
