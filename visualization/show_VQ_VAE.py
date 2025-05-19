@@ -33,7 +33,7 @@ if __name__=='__main__':
         pin_memory=True
     )
 
-    model.load_state_dict(torch.load("../state_dicts/VQ_VAE_small_sd1.pth"))
+    model.load_state_dict(torch.load("../state_dicts/VQ_VAE_small_sd2.pth"))
 
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 imgloss= myNets.DiffImageLoss(scaling=1.0, norm=True, lossfunc=torch.nn.functional.l1_loss)
-model= myNets.VAE(inputshape=(64, 64), latent_dim=344, convchannels=[64, 128, 256], fc_layers=[2048, 1024], beta=1.0)
+model= myNets.VAE(inputshape=(64, 64), latent_dim=245, convchannels=[64, 128, 256], fc_layers=[2048, 1024], beta=1.0)
 dataset= myDataSets.VaeDataset("../data/VAE_single_cell2_noise", "angles.npy")
 
 loader=DataLoader(
@@ -17,7 +17,7 @@ loader=DataLoader(
     pin_memory=True
 )
 
-model.load_state_dict(torch.load("../state_dicts/comp_VAE_sd_1.pth"))
+model.load_state_dict(torch.load("../state_dicts/comp_VAE_sd_2.pth"))
 
 model.eval()
 

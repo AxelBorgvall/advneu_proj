@@ -2,30 +2,40 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kornia.geometry.transform import translate,rotate
+from kornia.geometry.transform import translate,rotate,warp_affine
 from tqdm import tqdm
 
 class DoubleConv(nn.Module):
     """(Conv => ReLU => Conv => ReLU)"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels,act=nn.ReLU,norm=False):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
+        if not norm:
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1),
+                act(),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1),
+                act()
+            )
+        else:
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                act(),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                act()
+            )
 
     def forward(self, x):
         return self.conv(x)
 
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
-    def __init__(self, in_channels, out_channels,scaling=2):
+    def __init__(self, in_channels, out_channels,scaling=2,act=nn.ReLU,norm=False):
         super().__init__()
         self.down = nn.Sequential(
             nn.MaxPool2d(scaling),
-            DoubleConv(in_channels, out_channels)
+            DoubleConv(in_channels, out_channels,act,norm)
         )
 
     def forward(self, x):
@@ -33,14 +43,14 @@ class Down(nn.Module):
 
 class Up(nn.Module):
     """Upscaling then double conv"""
-    def __init__(self, in_channels, out_channels, bilinear=True,scaling=2):
+    def __init__(self, in_channels, out_channels, bilinear=True,scaling=2,act=nn.ReLU,norm=False):
         super().__init__()
         if bilinear:
             self.up = nn.Upsample(scale_factor=scaling, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels)
+            self.conv = DoubleConv(in_channels, out_channels,act,norm)
         else:
             self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, 2, stride=scaling)
-            self.conv = DoubleConv(in_channels, out_channels)
+            self.conv = DoubleConv(in_channels, out_channels,act,norm)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -83,29 +93,28 @@ class DoubleConvUnet(nn.Module):
         return self.outc(x)
 
 class Unet(nn.Module):
-    def __init__(self, n_channels, n_classes, layers=[64, 128, 256, 512], bilinear=True, scaling=2):
+    def __init__(self, n_channels, n_classes, layers=[64, 128, 256, 512], bilinear=True, scaling=2,act=nn.ReLU,norm=False):
         super().__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.downs=nn.ModuleList()
         self.ups=nn.ModuleList()
 
-        self.inc=DoubleConv(n_channels, layers[0])
+        self.inc=DoubleConv(n_channels, layers[0],norm=norm)
         self.outc=nn.Sequential(nn.Conv2d(layers[0], n_classes, kernel_size=1),nn.ReLU())
 
         self.nlayers=len(layers)
 
         self.xlist=[None]*self.nlayers
         for i in range(self.nlayers-1):
-            self.downs.append(Down(layers[i], layers[i + 1], scaling=scaling))
-            self.ups.append(Up(layers[self.nlayers-1-i]+layers[self.nlayers-2-i],layers[self.nlayers-2-i],scaling=scaling))
+            self.downs.append(Down(layers[i], layers[i + 1], scaling=scaling,act=act,norm=norm))
+            self.ups.append(Up(layers[self.nlayers-1-i]+layers[self.nlayers-2-i],layers[self.nlayers-2-i],scaling=scaling,bilinear=bilinear,act=act,norm=norm))
         self.to(self.device)
 
 
     def forward(self, x):
         self.xlist[0]=self.inc(x)
         for i in range(self.nlayers-1):
-
             self.xlist[i+1]=self.downs[i](self.xlist[i])
         x=self.xlist[-1]
         for i in range(self.nlayers-1):
@@ -124,6 +133,7 @@ def mass_centroid(tensor):
     y_coords = torch.linspace(-H/2,H/2,steps=H, device=device).float()
     x_coords = torch.linspace(-W/2,W/2,steps=W, device=device).float()
     y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')  # (H, W)
+
 
     x_grid = x_grid.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
     y_grid = y_grid.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
@@ -158,13 +168,83 @@ def inverse_rotation(preds,angles):
 
     return torch.bmm(R, preds.unsqueeze(2)).squeeze(2)  # (n,2)
 
+def image_affine_transform(image: torch.Tensor, affine_matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Applies an affine transformation to an image with (0,0) at the center.
+
+    Args:
+        image: Tensor of shape (B, C, H, W)
+        affine_matrix: Tensor of shape (B, 2, 3) in centered coordinates
+
+    Returns:
+        Transformed image of shape (B, C, H, W)
+    """
+    B, C, H, W = image.shape
+
+    # Convert center-origin affine to Kornia format (normalized coordinates)
+    center = torch.tensor([W / 2, H / 2], device=image.device).view(1, 1, 2)
+
+    # Build full 3x3 matrices for translation math
+    T_center = torch.eye(3, device=image.device).unsqueeze(0).repeat(B, 1, 1)
+    T_center[:, 0, 2] = -center[:, 0, 0]
+    T_center[:, 1, 2] = -center[:, 0, 1]
+
+    T_uncenter = torch.eye(3, device=image.device).unsqueeze(0).repeat(B, 1, 1)
+    T_uncenter[:, 0, 2] = center[:, 0, 0]
+    T_uncenter[:, 1, 2] = center[:, 0, 1]
+
+    # Add bottom row to affine_matrix to make it 3x3
+    A = torch.cat([affine_matrix, torch.tensor([[[0., 0., 1.]]], device=image.device).repeat(B, 1, 1)], dim=1)
+
+    # Combine transformations: uncenter @ A @ center
+    A_total = T_uncenter @ A @ T_center
+    A_total = A_total[:, :2, :]  # warp_affine expects (B, 2, 3)
+
+    # Apply transformation
+    return warp_affine(image, A_total, dsize=(H, W), align_corners=False)
 
 
-def image_flip(batch,flipx):
-    pass
+def forward_warp(
+        pts: torch.Tensor,  # [N,2], in centered coords
+        affine_matrix: torch.Tensor) -> torch.Tensor:
+    N = pts.shape[0]
+    device = pts.device
 
-def inverse_flip(preds,flipx):
-    pass
+    # make 3×3 from 2×3
+    A = torch.eye(3, device=device).unsqueeze(0).repeat(N, 1, 1)  # [N,3,3]
+    A[:, :2, :] = affine_matrix
+
+    # to homogeneous
+    hom = torch.cat([pts, torch.ones(N, 1, device=device)], dim=1)  # [N,3]
+
+    # matrix‐vector
+    out = (A @ hom.unsqueeze(-1)).squeeze(-1)  # [N,3]
+
+    return out[:, :2]
+
+
+def inverse_warp(
+        pts: torch.Tensor,
+        affine_matrix: torch.Tensor) -> torch.Tensor:
+    N = pts.shape[0]
+    device = pts.device
+
+    # build 3×3 blocks
+    A = torch.eye(3, device=device).unsqueeze(0).repeat(N, 1, 1)
+    A[:, :2, :] = affine_matrix  # [N,3,3]
+
+    # invert
+    A_inv = torch.inverse(A)  # [N,3,3]
+
+    # to homogeneous
+    hom = torch.cat([pts, torch.ones(N, 1, device=device)], dim=1)  # [N,3]
+
+    # apply
+    out = (A_inv @ hom.unsqueeze(-1)).squeeze(-1)  # [N,3]
+
+    return out[:, :2]
+
+
 
 
 class Localizer(nn.Module):
@@ -224,59 +304,126 @@ class Localizer(nn.Module):
         return mse_per_sample.sum()
 
 class LocalizerClassifier(nn.Module):
-    def __init__(self,model,n_transforms=8,**kwargs):
-        super(Localizer, self).__init__()
+    def __init__(self,model:nn.Module,n_transforms:int=8,baseoffset:int=120,affine_warp=0.4):
+        super(LocalizerClassifier, self).__init__()
         self.model = model
         self.n_transforms=n_transforms
+        self.offset=baseoffset
+        self.warp=affine_warp
         return
     def forward(self,x):
         return self.model(x)
 
-    def forward_tranform(self,batch,translation,angles):
-        transformed=image_translation(batch,translation)
-        return image_rotation(transformed,angles)
 
-    def inverse_tranform(self,pred,translation,angles):
+    def forward_transform(self, batch, translation, angles,affine,ignore):
+        # batch: (N, 1, H, W)
+        # ignore: (N, 1, h, w)
+        # translation: (N, 2)
+
+        _, _, H, W = batch.shape
+        N, _, h, w = ignore.shape
+
+        # Apply translation
+        transformed = image_translation(batch, translation)
+
+        # Compute offset where to paste the ignore image
+        # self.offset should be a scalar or tensor like (2,) for max translation
+        noise = torch.rand(N, 2, device=ignore.device) * (self.offset // 1.5)
+        ignore_offset = translation - self.offset + noise
+        ignore_offset[:, 0] += (H - h) // 2  # y
+        ignore_offset[:, 1] += (W - w) // 2  # x
+
+        # Round and convert to int
+        ignore_offset = ignore_offset.round().to(dtype=torch.long)
+
+        # Vectorized paste of ignore into transformed
+        patch_y = torch.arange(h, device=ignore.device).view(1, h, 1).expand(N, h, w)
+        patch_x = torch.arange(w, device=ignore.device).view(1, 1, w).expand(N, h, w)
+        offset_y = ignore_offset[:, 0].view(-1, 1, 1)
+        offset_x = ignore_offset[:, 1].view(-1, 1, 1)
+        target_y = patch_y + offset_y
+        target_x = patch_x + offset_x
+
+        # Mask for clipping if necessary (optional)
+        in_bounds = (target_y >= 0) & (target_y < H) & (target_x >= 0) & (target_x < W)
+
+        # Flatten indices for scatter
+        batch_idx = torch.arange(N, device=ignore.device).view(N, 1, 1).expand(N, h, w)
+        channel_idx = torch.zeros_like(batch_idx)
+
+        # Masked paste (ignore pixels out of bounds)
+        transformed[batch_idx[in_bounds], channel_idx[in_bounds], target_y[in_bounds], target_x[in_bounds]] = ignore.squeeze(1)[in_bounds]
+
+        transformed=image_affine_transform(transformed,affine)
+
+        '''
+        example_affine=torch.rand(N,2,3,device=transformed.device)*0.4-0.2+torch.tensor([[1,0,0],[0,1,0]],dtype=torch.float32,device=transformed.device).unsqueeze(0).repeat(N,1,1)
+        #first affine then rotation
+        output=image_affine_transform(transformed,example_affine)
+        output=image_rotation(output, angles).cpu().detach()
+        #first affine then rotation
+        coords=forward_warp(translation,example_affine)
+        coords=inverse_rotation(coords,-angles)
+
+        for i in range(len(output)):
+            plt.imshow(output[i].squeeze(),cmap="gray")
+            plt.scatter(coords[i,0].cpu().detach().squeeze()+W//2,coords[i,1].cpu().detach().squeeze()+H//2)
+            plt.show()
+        assert 1==0
+        '''
+
+        return image_rotation(transformed, angles)
+
+
+
+    def inverse_tranform(self,pred,translation,angles,affine):
         invpred=inverse_rotation(pred,angles)
+        invpred=inverse_warp(invpred,affine)
         return inverse_translation(invpred,translation)
 
-    def get_loss(self,image):
+    def get_loss(self,detect,ignore):
 
         #THIS ALL NEEDS TO BE REWRITTEN
 
-        b,c,h,w=image.shape
+        b,c,H,W=detect.shape
+        _,_,h,w=ignore.shape
         #expanding for transform
-        images=image.unsqueeze(1).expand(-1,self.n_transforms,-1,-1,-1).contiguous()
-
+        images=detect.unsqueeze(1).expand(-1,self.n_transforms,-1,-1,-1).contiguous()
+        ignores=ignore.unsqueeze(1).expand(-1,self.n_transforms,-1,-1,-1).contiguous()
         #flattening to feed into network
-        flat=images.view(b*self.n_transforms,c,h,w)
+        flat=images.view(b*self.n_transforms,c,H,W)
+        ignores=ignores.view(b*self.n_transforms,c,h,w)
+
 
         #getting random args
-        tr = torch.rand(b, self.n_transforms, 2, device=images.device) * h//3 - h//6  # translations
+        tr = torch.rand(b, self.n_transforms, 2, device=images.device) * h//2
         ag = torch.rand(b, self.n_transforms, device=images.device) * 360  # angles
+        af=torch.rand(b,self.n_transforms,2,3,device=images.device)*self.warp-self.warp/2+\
+                       torch.tensor([[1,0,0],[0,1,0]],dtype=torch.float32,device=images.device).unsqueeze(0).unsqueeze(0).repeat(b,self.n_transforms,1,1)
+
         #flatten random args
         tr_flat = tr.view(b * self.n_transforms, 2)
         ag_flat = ag.view(b * self.n_transforms, )
+        af_flat=af.view(b*self.n_transforms,2,3)
 
         #transform images, run model
-        transform_im=self.forward_tranform(flat,tr_flat,ag_flat)
+        transform_im=self.forward_transform(flat,tr_flat,ag_flat,af_flat,ignores)
         pred_flat=self.model(transform_im)
 
-
-
-        #preds=pred_flat.view(b,self.n_transforms,1,h,w)
 
         centroids_flat=mass_centroid(pred_flat)
 
 
+
         #invert transforms (do some flattening shit ig)
-        invpred=self.inverse_tranform(centroids_flat.squeeze(),tr_flat,ag_flat)
+        invpred=self.inverse_tranform(centroids_flat.squeeze(),tr_flat,ag_flat,af_flat)
         invpred = invpred.view(b, self.n_transforms, 2)
 
         # invpred: [B, T, 2]
 
         diffs = invpred[:, 1:, :] - invpred[:, :-1, :]  # [B, T-1, 2]
         mse_per_sample = torch.mean((diffs ** 2).sum(dim=-1), dim=1)  # [B]
+
         return mse_per_sample.sum()
 
 
@@ -312,6 +459,74 @@ def train_localizer(loc, dataloader, optimizer, epochs=300, filename="filename")
     finally:
         torch.save(loc.state_dict(), filename)
         print(f"Model saved to {filename}")
+
+def train_localizer_classifier(loc, dataloader, optimizer, epochs=300, filename="filename"):
+    loc.train()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    loc = loc.to(device)
+
+    try:
+        for epoch in range(1, epochs + 1):
+            epoch_loss = 0.0
+
+            # Wrap the dataloader in tqdm for batch-level progress
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}/{epochs}", leave=False)
+            for images, ignores in pbar:
+                images = images.to(device)
+                ignores = ignores.to(device)
+
+                optimizer.zero_grad()
+                loss = loc.get_loss(images, ignores)
+                loss.backward()
+                optimizer.step()
+
+                batch_loss = loss.item() * images.size(0)
+                epoch_loss += batch_loss
+
+                avg_loss = epoch_loss / len(dataloader.dataset)
+                pbar.set_postfix(loss=avg_loss)
+
+            print(f"Epoch {epoch:3d}/{epochs}, avg loss: {avg_loss:.4f}")
+
+    except KeyboardInterrupt:
+        print("\nTraining manually quit")
+    finally:
+        torch.save(loc.state_dict(), filename)
+        print(f"Model saved to {filename}")
+'''
+def train_localizer_classifier(loc, dataloader, optimizer, epochs=300, filename="filename"):
+    loc.train()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    loc = loc.to(device)
+    try:
+        for epoch in range(1, epochs + 1):
+            epoch_loss = 0.0
+            for images,ignores in dataloader:
+                images= images.to(device)
+                ignores =ignores.to(device)  # [B, C, H, W]
+
+
+                optimizer.zero_grad()
+                loss = loc.get_loss(images,ignores)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item() * images.size(0)  # sum up batch loss
+
+            avg_loss = epoch_loss / len(dataloader.dataset)
+            print(f"Epoch {epoch:3d}/{epochs}, avg loss: {avg_loss:.4f}")
+
+
+    except KeyboardInterrupt:
+        print("\n Training manually quit")
+    finally:
+        torch.save(loc.state_dict(), filename)
+        print(f"Model saved to {filename}")
+'''
+
 
 
 #VAE--------------------------------------------------------------------------------------------
@@ -737,7 +952,7 @@ class ConvUp(nn.Module):
 
 
 class VQLookUpTable(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost,refresh_every=-1,usage_threshold=1):
         super().__init__()
         #create lookup table
         self.n_emb=num_embeddings
@@ -754,7 +969,15 @@ class VQLookUpTable(nn.Module):
         # 2) Optionally scale down (e.g. to σ=0.1)
         #self.embedding.weight.data.mul_(0.1)
 
+
+        self.refresh_timer=refresh_every
+        self.counter=0
+        self.usage_threshold=usage_threshold
+        self.refresh=(refresh_every>0)
+
         self.commitment_cost = commitment_cost
+        self.register_buffer('usage', torch.zeros(self.n_emb, dtype=torch.long))
+
 
 
     def embedding_indices(self,inputs):
@@ -775,7 +998,6 @@ class VQLookUpTable(nn.Module):
         encoding_indices = torch.argmin(distances, dim=1)
         #unflattening
         encoding_indices = encoding_indices.view(B, H, W).unsqueeze(1)
-
         return encoding_indices
 
     def forward(self, inputs):
@@ -794,6 +1016,15 @@ class VQLookUpTable(nn.Module):
         # Find nearest embedding index for each input
         encoding_indices = torch.argmin(distances, dim=1)
         # Quantize: lookup embeddings
+
+        self.usage+=torch.bincount(encoding_indices,minlength=self.n_emb)
+
+        if self.refresh and self.counter>self.refresh_timer:
+            self.refresh_codebook(flat_input)
+        else:
+            self.counter+=1
+
+
         quantized = self.embedding(encoding_indices)  # (B*H*W, D)
 
         # Reshape back to (B, D, H, W)
@@ -809,25 +1040,37 @@ class VQLookUpTable(nn.Module):
         # Commitment loss: encourages encoder outputs to stay close to embeddings
         commit_loss = self.commitment_cost * F.mse_loss(inputs, quantized.detach())
         vq_loss = embed_loss + commit_loss
-        '''
-        with torch.no_grad():
-            unique_codes = torch.unique(encoding_indices)
-            print(unique_codes)
-            print(f"Codebook usage: {len(unique_codes)} / {self.embedding.num_embeddings}")
-            print(f"flat_input stats: mean={flat_input.mean().item():.4f}, std={flat_input.std().item():.4f}")
-            print(
-                f"embedding stats: mean={self.embedding.weight.mean().item():.4f}, std={self.embedding.weight.std().item():.4f}")
-            print(distances[0])  # should vary across embeddings
-            print(torch.argmin(distances[0]))  # check if it's always 1
-        '''
+
         return quantized_st, vq_loss
+
+    @torch.no_grad()
+    def refresh_codebook(self,flat_input):
+        device = self.embedding.weight.device
+        #used_counts = torch.bincount(encoding_indices, minlength=self.n_emb)
+
+        #Identify unused or low-usage codebook indices
+        underused = (self.usage <= self.usage_threshold).nonzero(as_tuple=False).squeeze()
+
+        if underused.numel() == 0:
+            return  # all entries are fine
+
+        # Select random input vectors to replace them with
+        rand_input_indices = torch.randint(0, flat_input.shape[0], (underused.shape[0],), device=device)
+        replacement_vectors = flat_input[rand_input_indices]
+
+        # Replace the dead entries
+        self.embedding.weight.data[underused] = replacement_vectors
+        self.usage*=0
+        self.counter=0
+
 
 
 class VQ_VAE(nn.Module):
     def __init__(self, encoder: nn.Module, decoder: nn.Module,
                  input_shape: tuple[int,int,int],
                  num_embeddings: int = 512,
-                 commitment_cost: float = 0.25,imageloss: nn.Module=DiffImageLoss()):
+                 commitment_cost: float = 0.25,imageloss: nn.Module=DiffImageLoss(),
+                 codebook_refresh_period: int=-1,codebook_usage_threshold=1):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -844,7 +1087,9 @@ class VQ_VAE(nn.Module):
         self.vq = VQLookUpTable(
             num_embeddings=num_embeddings,
             embedding_dim=D,
-            commitment_cost=commitment_cost
+            commitment_cost=commitment_cost,
+            refresh_every=codebook_refresh_period,
+            usage_threshold=codebook_usage_threshold
         )
 
     def get_indices(self,x):

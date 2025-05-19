@@ -1,8 +1,11 @@
+import random
+
 import tifffile
 import torch
 import numpy as np
 from torch.utils.data import Dataset
 import os
+import torchvision
 
 def pad_tensor(tensor, cent, newshape):
     # newshape: (H, W)
@@ -95,33 +98,76 @@ class SingleCellDataset(Dataset):
         return self.inputs[idx]
 
 class LocClassDataset(Dataset):
-    HIGHEST_VALUE=36863.0
-    LOWEST_VALUE=32995.0
-    def __init__(self, dir, target_l,repeat=1):
-        # Assuming inputs and targets are lists, convert them to tensors
-        images=[]
-        for filename in os.listdir(dir):
-            filepath = os.path.join(dir, filename)
-            if os.path.isfile(filepath):
-                images.append(torch.load(filepath))
+    def __init__(self, find_dir: list, ignore_dir: list, shape: tuple, noise_mean=0.0, noise_std=1.0):
+        self.target_shape = shape  # (H, W)
+        self.noise_mean = noise_mean
+        self.noise_std = noise_std
+        self.images = []
+        self.ignores = []
 
-        for i,im in enumerate(images):
-            # normalize according to max and min in dataset
-            im=im.to(torch.float)
-            im=(im-self.LOWEST_VALUE)/(self.HIGHEST_VALUE-self.LOWEST_VALUE)
-            # Pad to uniform size with plenty of space to transform
-            cent=mass_centroid(im[None,None,...])
-            im=pad_tensor(im,cent,(target_l,target_l)).view(1,target_l,target_l)
-            images[i]=im
+        # Load and process main images (with padding)
+        for dir in find_dir:
+            for f in os.listdir(dir):
+                if f.lower().endswith(".tif"):
+                    path = os.path.join(dir, f)
+                    tensor = self._load_and_pad_image(path)
+                    self.images.append(tensor)
 
-        # arrange into tensor and move to CUDA
-        self.inputs = torch.stack([torch.tensor(i) for i in images] * repeat)
+        # Load and store ignore images (raw, no padding)
+        for dir in ignore_dir:
+            for f in os.listdir(dir):
+                if f.lower().endswith(".tif"):
+                    path = os.path.join(dir, f)
+                    tensor = self._load_image_raw(path)
+                    self.ignores.append(tensor)
+
+        self.pairs = [(i, j) for i in range(len(self.images)) for j in range(len(self.ignores))]
+        random.shuffle(self.pairs)
+
+
+    def _load_and_pad_image(self, path):
+        img_np = tifffile.imread(path)
+        img_tensor = torch.tensor(img_np, dtype=torch.float32)
+
+        # [C, H, W]
+        if img_tensor.ndim == 2:
+            img_tensor = img_tensor.unsqueeze(0)
+        elif img_tensor.ndim == 3 and img_tensor.shape[0] not in [1, 3]:
+            img_tensor = img_tensor.permute(2, 0, 1)
+
+        c, h, w = img_tensor.shape
+        th, tw = self.target_shape
+
+        if h > th or w > tw:
+            raise ValueError(f"Image at {path} is larger than target shape {self.target_shape}")
+
+        padded = torch.normal(mean=self.noise_mean, std=self.noise_std, size=(c, th, tw))
+        padded[padded < 0] = 0
+
+        top = (th - h) // 2
+        left = (tw - w) // 2
+        padded[:, top:top + h, left:left + w] = img_tensor
+        return padded
+
+    def _load_image_raw(self, path):
+        img_np = tifffile.imread(path)
+        img_tensor = torch.tensor(img_np, dtype=torch.float32)
+
+        # Convert to [C, H, W] if needed
+        if img_tensor.ndim == 2:
+            img_tensor = img_tensor.unsqueeze(0)
+        elif img_tensor.ndim == 3 and img_tensor.shape[0] not in [1, 3]:
+            img_tensor = img_tensor.permute(2, 0, 1)
+
+        return img_tensor
 
     def __len__(self):
-        return self.inputs.__len__()
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        return self.inputs[idx]
+        i, j = self.pairs[idx]
+        return self.images[i], self.ignores[j]
+
 
 class VaeDataset(Dataset):
     def __init__(self, image_dir, angles_filename, transform=None):
